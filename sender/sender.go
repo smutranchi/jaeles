@@ -19,10 +19,14 @@ import (
 
 // JustSend just sending request
 func JustSend(options libs.Options, req libs.Request) (res libs.Response, err error) {
+	if req.Method == "" {
+		req.Method = "GET"
+	}
 	method := req.Method
 	url := req.URL
 	body := req.Body
 	headers := GetHeaders(req)
+
 	timeout := options.Timeout
 	if req.Timeout > 0 {
 		timeout = req.Timeout
@@ -131,38 +135,39 @@ func JustSend(options libs.Options, req libs.Request) (res libs.Response, err er
 
 	var resp *resty.Response
 	// really sending things here
+	method = strings.ToLower(strings.TrimSpace(method))
 	switch method {
-	case "GET":
+	case "get":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Get(url)
 		break
-	case "POST":
+	case "post":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Post(url)
 		break
-	case "HEAD":
+	case "head":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Head(url)
 		break
-	case "OPTIONS":
+	case "options":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Options(url)
 		break
-	case "PATCH":
+	case "patch":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Patch(url)
 		break
-	case "PUT":
+	case "put":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Put(url)
 		break
-	case "DELETE":
+	case "delete":
 		resp, err = client.R().
 			SetBody([]byte(body)).
 			Delete(url)

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 func init() {
@@ -26,6 +27,7 @@ func init() {
 	scanCmd.Flags().StringP("url", "u", "", "URL of target")
 	scanCmd.Flags().StringP("urls", "U", "", "URLs file of target")
 	scanCmd.Flags().StringP("raw", "r", "", "Raw request from Burp for origin")
+	scanCmd.Flags().Bool("html", false, "Generate HTML report after done")
 	scanCmd.SetHelpFunc(ScanHelp)
 	RootCmd.AddCommand(scanCmd)
 }
@@ -63,7 +65,8 @@ func runScan(cmd *cobra.Command, _ []string) error {
 	}
 
 	if len(urls) == 0 {
-		utils.ErrorF("No Input found")
+		fmt.Println("[Error] No signature loaded")
+		ScanMessage()
 		os.Exit(1)
 	}
 	utils.InforF("Input Loaded: %v", len(urls))
@@ -100,10 +103,16 @@ func runScan(cmd *cobra.Command, _ []string) error {
 			continue
 		}
 
+		// pass to parallel to run later
+		if sign.Parallel {
+			options.ParallelSigns = append(options.ParallelSigns, signFile)
+			continue
+		}
+
 		p, _ := ants.NewPoolWithFunc(options.Concurrency, func(i interface{}) {
-			startScanJob(i)
+			startSingleJob(i)
 			wg.Done()
-		})
+		}, ants.WithPreAlloc(true))
 		defer p.Release()
 
 		//get origin from -r req.txt options
@@ -117,66 +126,106 @@ func runScan(cmd *cobra.Command, _ []string) error {
 		// Submit tasks one by one.
 		for _, url := range urls {
 			wg.Add(1)
-			job := libs.Job{url, sign}
+			job := libs.Job{URL: url, Sign: sign}
 			_ = p.Invoke(job)
 		}
 	}
+
+	// run parallel routine instead
+	if !options.DisableParallel || len(options.ParallelSigns) > 0 {
+		utils.InforF("Sending request with Parallel mode.")
+		// pass all signs to parallel if forced from cli
+		if !options.DisableParallel {
+			options.ParallelSigns = options.SelectedSigns
+		}
+		runParallel(urls)
+	}
+
 	wg.Wait()
+	CleanOutput()
+
+	genReport, _ := cmd.Flags().GetBool("html")
+	if genReport == true && utils.FolderExists(options.Output) {
+		DoGenReport(options)
+	}
 	return nil
 }
 
-func startScanJob(j interface{}) {
+func startSingleJob(j interface{}) {
 	job := j.(libs.Job)
-	RunJob(job.URL, job.Sign, options)
+	originRec, sign, target := InitJob(job.URL, job.Sign)
+	realReqs := genRequests(sign, target)
+	SendRequests(realReqs, sign, originRec)
 }
 
-// RunJob really run the job
-func RunJob(url string, sign libs.Signature, options libs.Options) {
+// InitJob init origin and some variables
+func InitJob(url string, sign libs.Signature) (libs.Record, libs.Signature, map[string]string) {
 	var originRec libs.Record
-	var err error
-
+	var origin libs.Origin
 	// prepare initial signature and variables
 	Target := core.ParseTarget(url)
 	Target = core.MoreVariables(Target, sign, options)
 	sign.Target = Target
-	// sending original
+	// base origin
 	if sign.Origin.Method != "" {
-		var originReq libs.Request
-		var originRes libs.Response
-
-		originSign := sign
-		if sign.Origin.Raw == "" {
-			originSign.Target = Target
-			originReq = core.ParseOrigin(originSign.Origin, originSign, options)
-		} else {
-			originReq = sign.Origin
-		}
-
-		originRes, err = sender.JustSend(options, originReq)
-		if err == nil {
-			if options.Verbose && (originReq.Method != "") {
-				fmt.Printf("[Sent-Origin] %v %v \n", originReq.Method, originReq.URL)
-			}
-		}
-		originRec.Request = originReq
-		originRec.Response = originRes
-		// set some more variables
-		core.RunConclusions(originRec, &originSign)
-		for k, v := range originSign.Target {
-			if Target[k] == "" {
-				Target[k] = v
-			}
-		}
+		origin, Target = sendOrigin(sign, sign.Origin, Target)
+		originRec.Request = origin.ORequest
+		originRec.Response = origin.OResponse
 	}
-	singleJob(originRec, sign, Target)
+	// in case we have many origin
+	if len(sign.Origins) > 0 {
+		var origins []libs.Origin
+		for index, origin := range sign.Origins {
+			origin, Target = sendOrigin(sign, origin.ORequest, Target)
+			if origin.Label == "" {
+				origin.Label = fmt.Sprintf("%v", index)
+			}
+			origins = append(origins, origin)
+		}
+		sign.Origins = origins
+	}
+
+	return originRec, sign, Target
 }
 
-func singleJob(originRec libs.Record, sign libs.Signature, target map[string]string) {
+// sending origin request
+func sendOrigin(sign libs.Signature, originReq libs.Request, target map[string]string) (libs.Origin, map[string]string) {
+	var origin libs.Origin
+	var err error
+	var originRes libs.Response
+
+	originSign := sign
+	if originReq.Raw == "" {
+		originSign.Target = target
+		originReq = core.ParseOrigin(originReq, originSign, options)
+	}
+
+	originRes, err = sender.JustSend(options, originReq)
+	if err == nil {
+		if options.Verbose && (originReq.Method != "") {
+			fmt.Printf("[Sent-Origin] %v %v %v %v %v\n", originReq.Method, originReq.URL, originRes.Status, originRes.ResponseTime, len(originRes.Beautify))
+		}
+	}
+	originRec := libs.Record{Request: originReq, Response: originRes}
+	// set some more variables
+	core.RunConclusions(originRec, &originSign)
+	for k, v := range originSign.Target {
+		if target[k] == "" {
+			target[k] = v
+		}
+	}
+	origin.ORequest = originReq
+	origin.OResponse = originRes
+	return origin, target
+}
+
+// generate request for sending
+func genRequests(sign libs.Signature, target map[string]string) []libs.Request {
 	// quick param for calling resource
 	sign.Target = core.MoreVariables(sign.Target, sign, options)
 
+	var realReqs []libs.Request
 	globalVariables := core.ParseVariable(sign)
-	// if Parallel not enable, override the threads
 	if len(globalVariables) > 0 {
 		for _, globalVariable := range globalVariables {
 			sign.Target = target
@@ -190,8 +239,7 @@ func singleJob(originRec libs.Record, sign libs.Signature, target map[string]str
 					req.Raw = sign.RawRequest
 				}
 				// gen bunch of request to send
-				realReqs := core.ParseRequest(req, sign, options)
-				SendRequests(realReqs, sign, originRec)
+				realReqs = append(realReqs, core.ParseRequest(req, sign, options)...)
 			}
 		}
 	} else {
@@ -203,11 +251,10 @@ func singleJob(originRec libs.Record, sign libs.Signature, target map[string]str
 				req.Raw = sign.RawRequest
 			}
 			// gen bunch of request to send
-			realReqs := core.ParseRequest(req, sign, options)
-			// sending things
-			SendRequests(realReqs, sign, originRec)
+			realReqs = append(realReqs, core.ParseRequest(req, sign, options)...)
 		}
 	}
+	return realReqs
 }
 
 // SendRequests sending request generated
@@ -233,6 +280,11 @@ func SendRequests(realReqs []libs.Request, sign libs.Signature, originRec libs.R
 			}
 		}
 
+		if options.Delay > 0 {
+			utils.DebugF("Delay sending request: %v", options.Delay)
+			time.Sleep(time.Duration(options.Delay) * time.Second)
+		}
+
 		// run middleware here
 		if !funk.IsEmpty(realRec.Request.Middlewares) {
 			core.MiddleWare(&realRec, options)
@@ -251,21 +303,116 @@ func SendRequests(realReqs []libs.Request, sign libs.Signature, originRec libs.R
 			realRec.Request = req
 			realRec.Response = res
 		}
-
 		DoAnalyze(realRec, &sign)
 	}
+}
+
+// Start parallels jobs
+func runParallel(urls []string) {
+	var wg sync.WaitGroup
+	p, _ := ants.NewPoolWithFunc(options.Concurrency, func(i interface{}) {
+		parallelJob(i)
+		wg.Done()
+	}, ants.WithPreAlloc(true))
+	defer p.Release()
+
+	for _, signFile := range options.ParallelSigns {
+		sign, err := core.ParseSign(signFile)
+		if err != nil {
+			utils.ErrorF("Error parsing YAML sign %v", signFile)
+			continue
+		}
+		// filter signature by level
+		if sign.Level > options.Level {
+			continue
+		}
+		// avoid duplicate sending in signature
+		if sign.Single {
+			continue
+		}
+
+		// Submit tasks one by one.
+		for _, url := range urls {
+			originRec, sign, target := InitJob(url, sign)
+			realReqs := genRequests(sign, target)
+			for _, req := range realReqs {
+				wg.Add(1)
+				// parsing request here
+				job := libs.PJob{
+					Req:  req,
+					ORec: originRec,
+					Sign: sign,
+				}
+				_ = p.Invoke(job)
+			}
+		}
+
+	}
+	wg.Wait()
+}
+
+func parallelJob(j interface{}) {
+	job := j.(libs.PJob)
+	parallelSending(job.Req, job.Sign, job.ORec)
+}
+
+// sending func for parallel mode
+func parallelSending(realReq libs.Request, sign libs.Signature, originRec libs.Record) {
+	var realRec libs.Record
+	// set some stuff
+	realRec.OriginReq = originRec.Request
+	realRec.OriginRes = originRec.Response
+	realRec.Request = realReq
+	realRec.Request.Target = sign.Target
+	realRec.Sign = sign
+	realRec.ScanID = options.ScanID
+
+	// replace things second time here with values section
+	core.AltResolveRequest(&realRec.Request)
+
+	// check conditions
+	if len(realRec.Request.Conditions) > 0 {
+		validate := checkConditions(realRec)
+		if !validate {
+			return
+		}
+	}
+
+	// run middleware here
+	if !funk.IsEmpty(realRec.Request.Middlewares) {
+		core.MiddleWare(&realRec, options)
+	}
+
+	req := realRec.Request
+	// if middleware return the response skip sending it
+	if realRec.Response.StatusCode == 0 && realRec.Request.Method != "" && realRec.Request.MiddlewareOutput == "" {
+		var res libs.Response
+		// sending with real browser
+		if req.Engine == "chrome" {
+			res, _ = sender.SendWithChrome(options, req)
+		} else {
+			res, _ = sender.JustSend(options, req)
+		}
+		realRec.Request = req
+		realRec.Response = res
+	}
+	DoAnalyze(realRec, &sign)
 }
 
 func DoAnalyze(realRec libs.Record, sign *libs.Signature) {
 	// print some log
 	if options.Verbose && realRec.Request.Method != "" {
 		if realRec.Response.StatusCode != 0 {
-			fmt.Printf("[Sent] %v %v %v %v\n", realRec.Request.Method, realRec.Request.URL, realRec.Response.Status, realRec.Response.ResponseTime)
+			fmt.Printf("[Sent] %v %v %v %v %v \n", realRec.Request.Method, realRec.Request.URL, realRec.Response.Status, realRec.Response.ResponseTime, len(realRec.Response.Beautify))
 		}
 		// middleware part
 		if realRec.Request.MiddlewareOutput != "" {
 			utils.DebugF(realRec.Request.MiddlewareOutput)
 		}
+	}
+
+	if len(sign.Origins) > 0 {
+		realRec.Origins = sign.Origins
 	}
 
 	// set new values for next request here
@@ -275,7 +422,9 @@ func DoAnalyze(realRec libs.Record, sign *libs.Signature) {
 
 	// do passive scan
 	if options.EnablePassive || sign.Passive {
-		core.PassiveAnalyze(options, realRec)
+		if !realRec.DonePassive {
+			core.PassiveAnalyze(options, realRec)
+		}
 	}
 }
 

@@ -20,13 +20,18 @@ import (
 func ParseSign(signFile string) (sign libs.Signature, err error) {
 	yamlFile, err := ioutil.ReadFile(signFile)
 	if err != nil {
-		utils.ErrorF("yamlFile.Get err  #%v - %v", err, signFile)
+		utils.ErrorF("Error parsing Signature:  #%v - %v", err, signFile)
 	}
 	err = yaml.Unmarshal(yamlFile, &sign)
 	if err != nil {
 		utils.ErrorF("Error: %v - %v", err, signFile)
 	}
 	// set some default value
+	sign.Parallel = true
+	if sign.Single {
+		sign.Parallel = false
+	}
+	sign.RawPath = signFile
 	if sign.Info.Category == "" {
 		if strings.Contains(sign.ID, "-") {
 			sign.Info.Category = strings.Split(sign.ID, "-")[0]
@@ -47,11 +52,14 @@ func ParseSign(signFile string) (sign libs.Signature, err error) {
 func ParsePassive(passiveFile string) (passive libs.Passive, err error) {
 	yamlFile, err := ioutil.ReadFile(passiveFile)
 	if err != nil {
-		utils.ErrorF("yamlFile.Get err  #%v - %v", err, passiveFile)
+		utils.ErrorF("Error parsing Signature:  #%v - %v", err, passiveFile)
 	}
 	err = yaml.Unmarshal(yamlFile, &passive)
 	if err != nil {
 		utils.ErrorF("Error: %v - %v", err, passiveFile)
+	}
+	if passive.Risk == "" {
+		passive.Risk = "Potential"
 	}
 	return passive, err
 }
@@ -130,6 +138,7 @@ func MoreVariables(target map[string]string, sign libs.Signature, options libs.O
 
 	// more options
 	realTarget["Root"] = options.RootFolder
+	realTarget["Version"] = fmt.Sprintf("Jaeles - %v", libs.VERSION)
 	realTarget["Resources"] = options.ResourcesFolder
 	realTarget["ThirdParty"] = options.ThirdPartyFolder
 	realTarget["proxy"] = options.Proxy
@@ -182,11 +191,27 @@ func ParseParams(rawParams []string) map[string]string {
 	return params
 }
 
+// ParseRawHeaders parse more headers from cli
+func ParseRawHeaders(rawHeaders []string) map[string]string {
+	headers := make(map[string]string)
+
+	for _, item := range rawHeaders {
+		if strings.Contains(item, ":") {
+			data := strings.Split(item, ":")
+			headers[data[0]] = strings.Join(data[1:], "")
+		}
+	}
+	return headers
+}
+
 // ParseOrigin parse origin request
-func ParseOrigin(req libs.Request, sign libs.Signature, options libs.Options) libs.Request {
+func ParseOrigin(req libs.Request, sign libs.Signature, _ libs.Options) libs.Request {
 	target := sign.Target
 	// resolve some parts with global variables first
 	req.Target = target
+	if strings.Contains(req.Method, "{{.") {
+		req.Method = ResolveVariable(req.Method, target)
+	}
 	req.URL = ResolveVariable(req.URL, target)
 	// @NOTE: backward compatible
 	if req.URL == "" && req.Path != "" {
@@ -210,12 +235,15 @@ func ParseOrigin(req libs.Request, sign libs.Signature, options libs.Options) li
 }
 
 // ParseRequest parse request part in YAML signature file
-func ParseRequest(req libs.Request, sign libs.Signature, _ libs.Options) []libs.Request {
+func ParseRequest(req libs.Request, sign libs.Signature, options libs.Options) []libs.Request {
 	var Reqs []libs.Request
 	target := sign.Target
 
 	// resolve some parts with global variables first
 	req.Target = target
+	if strings.Contains(req.Method, "{{.") {
+		req.Method = ResolveVariable(req.Method, target)
+	}
 	req.URL = ResolveVariable(req.URL, target)
 	// @NOTE: backward compatible
 	if req.URL == "" && req.Path != "" {
@@ -223,6 +251,17 @@ func ParseRequest(req libs.Request, sign libs.Signature, _ libs.Options) []libs.
 	}
 	req.Body = ResolveVariable(req.Body, target)
 	req.Headers = ResolveHeader(req.Headers, target)
+
+	// more headers from cli
+	if len(options.Headers) > 0 {
+		moreHeaders := ParseRawHeaders(options.Headers)
+		for k, v := range moreHeaders {
+			element := make(map[string]string)
+			element[k] = ResolveVariable(v, req.Target)
+			req.Headers = append(req.Headers, element)
+		}
+	}
+
 	req.Middlewares = ResolveDetection(req.Middlewares, target)
 	req.Conditions = ResolveDetection(req.Conditions, target)
 

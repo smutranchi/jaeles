@@ -2,18 +2,21 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+
 	"github.com/jaeles-project/jaeles/core"
 	"github.com/jaeles-project/jaeles/database"
 	"github.com/jaeles-project/jaeles/libs"
 	"github.com/jaeles-project/jaeles/utils"
 	"github.com/spf13/cobra"
-	"os"
-	"path"
-	"path/filepath"
 )
 
 func init() {
-	// configCmd represents the config command
 	var configCmd = &cobra.Command{
 		Use:   "config",
 		Short: "Configuration CLI",
@@ -26,6 +29,7 @@ func init() {
 	configCmd.Flags().String("user", "", "Username")
 	configCmd.Flags().String("pass", "", "Password")
 	configCmd.Flags().Bool("hh", false, "More helper")
+	configCmd.Flags().Bool("mics", true, "Skip import mics signatures")
 	configCmd.Flags().Bool("poll", false, "Polling all record in OOB config")
 	// used for update action
 	configCmd.Flags().String("secret", "", "Secret of Burp Collab")
@@ -40,6 +44,7 @@ func init() {
 func runConfig(cmd *cobra.Command, _ []string) error {
 	// print more help
 	helps, _ := cmd.Flags().GetBool("hh")
+	mics, _ := cmd.Flags().GetBool("mics")
 	if helps == true {
 		HelpMessage()
 		os.Exit(1)
@@ -69,7 +74,7 @@ func runConfig(cmd *cobra.Command, _ []string) error {
 		core.UpdatePlugins(options)
 		repo, _ := cmd.Flags().GetString("repo")
 		core.UpdateSignature(options, repo)
-		reloadSignature(path.Join(options.RootFolder, "base-signatures"))
+		reloadSignature(path.Join(options.RootFolder, "base-signatures"), mics)
 		break
 	case "clear":
 		database.CleanScans()
@@ -97,10 +102,10 @@ func runConfig(cmd *cobra.Command, _ []string) error {
 		break
 
 	case "init":
-		reloadSignature(options.SignFolder)
+		reloadSignature(options.SignFolder, mics)
 		break
 	case "reload":
-		reloadSignature(options.SignFolder)
+		reloadSignature(options.SignFolder, mics)
 		break
 	default:
 		HelpMessage()
@@ -109,7 +114,8 @@ func runConfig(cmd *cobra.Command, _ []string) error {
 }
 
 // reloadSignature signature
-func reloadSignature(signFolder string) {
+func reloadSignature(signFolder string, skipMics bool) {
+	signFolder = utils.NormalizePath(signFolder)
 	if !utils.FolderExists(signFolder) {
 		utils.ErrorF("Signature folder not found: %v", signFolder)
 		return
@@ -124,6 +130,17 @@ func reloadSignature(signFolder string) {
 	if allSigns != nil {
 		utils.InforF("Load Signature from: %v", SignFolder)
 		for _, signFile := range allSigns {
+			if skipMics {
+				if strings.Contains(signFile, "/mics/") {
+					utils.DebugF("Skip sign: %v", signFile)
+					continue
+				}
+
+				if strings.Contains(signFile, "/exper/") {
+					utils.DebugF("Skip sign: %v", signFile)
+					continue
+				}
+			}
 			database.ImportSign(signFile)
 		}
 	}
@@ -148,22 +165,24 @@ func reloadSignature(signFolder string) {
 }
 
 func configHelp(_ *cobra.Command, _ []string) {
+	fmt.Println(libs.Banner())
 	HelpMessage()
 }
 
 func rootHelp(_ *cobra.Command, _ []string) {
+	fmt.Println(libs.Banner())
 	RootMessage()
 }
 
 // RootMessage print help message
 func RootMessage() {
-	fmt.Println(libs.Banner())
 	h := "\nUsage:\n jaeles scan|server|config [options]\n"
-	h += " jaeles scan|server|config -h -- Show usage message\n"
+	h += " jaeles scan|server|config|report -h -- Show usage message\n"
 	h += "\nSubcommands:\n"
 	h += "  jaeles scan   --  Scan list of URLs based on selected signatures\n"
 	h += "  jaeles server --  Start API server\n"
 	h += "  jaeles config --  Configuration CLI \n"
+	h += "  jaeles report --  Generate HTML report based on scanned output \n"
 	h += `
 Core Flags:
   -c, --concurrency int         Set the concurrency level (default 20)
@@ -173,6 +192,7 @@ Core Flags:
   -L, --level int               Filter signatures by level (default 1)
   -G, --passive                 Turn on passive detections
   -p, --params strings          Custom params -p='foo=bar' (Multiple -p flags are accepted)
+  -H, --headers strings         Custom headers (e.g: -H 'Referer: {{.BaseURL}}') (Multiple -H flags are accepted)
 
 Mics Flags:
       --proxy string            proxy
@@ -185,22 +205,29 @@ Mics Flags:
       --passiveSummary string   Passive Summary file
   -S, --selectorFile string     Signature selector from file
       --sp string               Selector for passive detections (default "*")
+      --single string           Forced running in single mode
+  -q, --quite                   Quite Output
+  -Q, --quiteFormat string      Format for quite output (default "{{.VulnURL}}")
+  -R, --report string     		HTML report file name
+      --html string     		Enable generate HTML reports after the scan done 
 `
 	h += "\n\nExamples Commands:\n"
-	h += "  jaeles scan -s <signature> -u <url>\n"
-	h += "  jaeles scan -c 50 -s <signature> -U <list_urls>\n"
+	h += "  jaeles scan -s 'jira' -s 'ruby' -u target.com\n"
+	h += "  jaeles scan -c 50 -s 'java' -x 'tomcat' -U list_of_urls.txt\n"
+	h += "  jaeles scan -G -c 50 -s '/tmp/custom-signature/.*' -U list_of_urls.txt\n"
+	h += "  jaeles scan -c 50 -S list_of_selectors.txt -U list_of_urls.txt -H 'Referer: {{.BaseURL}}/x' \n"
 	h += "  jaeles scan -s <signature> -s <another-selector> -u http://example.com\n"
-	h += "  cat list_target.txt | jaeles scan -c 100 -s <signature>\n"
+	h += "  cat list_target.txt | jaeles scan -c 50 -s <signature>\n"
 	h += "\nOthers Commands:\n"
 	h += "  jaeles server -s '/tmp/custom-signature/sensitive/.*' -L 2\n"
 	h += "  jaeles config -a reload --signDir /tmp/signatures-folder/\n"
 	h += "  jaeles config -a update --repo https://github.com/jaeles-project/jaeles-signatures\n"
-	fmt.Printf(h)
+	h += "  jaeles report -o /tmp/scanned/out\n"
+	fmt.Println(h)
 }
 
 // HelpMessage print help message
 func HelpMessage() {
-	fmt.Println(libs.Banner())
 	h := "\nConfig Command example:\n\n"
 	h += "  jaeles config -a init\n\n"
 	h += "  jaeles config -a update --repo http://github.com/jaeles-project/another-signatures --user admin --pass admin\n"
@@ -209,11 +236,16 @@ func HelpMessage() {
 	h += "  jaeles config -a reload\n\n"
 	h += "  jaeles config -a reload --signDir /tmp/custom-signatures/\n\n"
 	h += "  jaeles config -a cred --user sample --pass not123456\n\n"
-	fmt.Printf(h)
+	fmt.Println(h)
 }
 
 func ScanHelp(_ *cobra.Command, _ []string) {
 	fmt.Println(libs.Banner())
+	ScanMessage()
+}
+
+// ScanMessage print help message
+func ScanMessage() {
 	h := "\nScan Usage example:\n"
 	h += "  jaeles scan -s <signature> -u <url>\n"
 	h += "  jaeles scan -c 50 -s <signature> -U <list_urls> -L <level-of-signatures>\n"
@@ -232,5 +264,43 @@ func ScanHelp(_ *cobra.Command, _ []string) {
 	h += "  jaeles scan -v -s '~/my-signatures/products/wordpress/.*' -u 'https://wp.example.com' -p 'root=[[.URL]]'\n"
 	h += "  cat urls.txt | grep 'interesting' | jaeles scan -L 5 -c 50 -s 'fuzz/.*' -U list_of_urls.txt --proxy http://127.0.0.1:8080\n"
 	h += "\n"
-	fmt.Printf(h)
+	fmt.Println(h)
+}
+
+// ReportHelp report help message
+func ReportHelp(_ *cobra.Command, _ []string) {
+	fmt.Println(libs.Banner())
+	ReportMessage()
+}
+
+// ReportHelp print help message
+func ReportMessage() {
+	h := "\nReport Command example:\n\n"
+	h += `
+  -h, --help              help for report
+      --template string   Report Template File (default "~/.jaeles/plugins/report/index.html")
+	`
+	fmt.Println(h)
+}
+
+func CleanOutput() {
+	// clean output
+	if utils.DirLength(options.Output) == 0 {
+		os.RemoveAll(options.Output)
+	}
+	if utils.DirLength(options.PassiveFolder) == 0 {
+		os.RemoveAll(options.PassiveFolder)
+	}
+
+	// unique vulnSummary
+	// Sort sort content of a file
+	data := utils.ReadingFileUnique(options.SummaryVuln)
+	if len(data) == 0 {
+		return
+	}
+	sort.Strings(data)
+	content := strings.Join(data, "\n")
+	// remove blank line
+	content = regexp.MustCompile(`[\t\r\n]+`).ReplaceAllString(strings.TrimSpace(content), "\n")
+	utils.WriteToFile(options.SummaryVuln, content)
 }

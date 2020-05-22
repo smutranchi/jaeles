@@ -2,11 +2,14 @@ package libs
 
 // Signature base signature struct
 type Signature struct {
-	ID      string
-	Type    string
-	Level   int
-	Passive bool
-	Info    struct {
+	ID       string
+	RawPath  string
+	Type     string
+	Level    int
+	Passive  bool
+	Parallel bool
+	Single   bool
+	Info     struct {
 		Name     string
 		Category string
 		Risk     string
@@ -15,6 +18,7 @@ type Signature struct {
 	}
 
 	Origin     Request
+	Origins    []Origin
 	Requests   []Request
 	RawRequest string
 	Payloads   []string
